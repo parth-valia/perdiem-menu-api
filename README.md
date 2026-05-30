@@ -1,85 +1,218 @@
 # perdiem-menu-api
 
-Node.js + Express + TypeScript backend for the Per Diem menu browser take-home. Proxies Square's Catalog and Locations APIs so the mobile client never touches a Square access token.
+Node.js + Express + TypeScript backend for the Per Diem menu browser take-home.
+
+Proxies Square's Catalog, Locations, and Inventory APIs so the React Native client never touches a Square access token. Resolves time/day availability server-side using the location's IANA timezone and bundles a simple `availableNow: boolean` plus a human-readable reason into every catalog response.
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Install
+# 1. Install dependencies
 npm install
 
-# 2. Configure
+# 2. Configure environment
 cp .env.example .env
-# Fill in your Square sandbox access token
+# Set SQUARE_ACCESS_TOKEN to your sandbox token (never use a production token here)
 
-# 3. Run dev server (hot-reload)
+# 3. Seed Square sandbox with locations, categories, items, and availability periods
+node seed-sandbox.js
+
+# 4. Start dev server (hot-reload via ts-node-dev)
 npm run dev
 ```
 
-Server starts on `http://localhost:3001`.
+Server starts on **http://localhost:3001**.
+
+```bash
+# Smoke test
+curl http://localhost:3001/api/v1/health
+# {"status":"ok","timestamp":"..."}
+```
 
 ---
 
 ## Endpoints
 
 | Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/health` | Health check |
-| GET | `/api/v1/locations` | All active Square locations (ACTIVE status only) |
-| GET | `/api/v1/catalog/:locationId` | Menu items filtered to a location, with time/day availability and inventory counts bundled in one response |
+| ------ | ---- | ----------- |
+| GET | `/api/v1/health` | Load-balancer health check |
+| GET | `/api/v1/locations` | All ACTIVE Square locations with address and IANA timezone |
+| GET | `/api/v1/catalog/:locationId` | Location-filtered items with availability and inventory bundled |
 
-> **Inventory** is resolved as part of `/catalog/:locationId` (not a separate endpoint). The catalog call enriches each variation with `inStock` and `quantity` from Square's Inventory API. If the inventory call fails, it degrades gracefully — the menu still loads and items default to in-stock.
+**Inventory** is part of `/catalog/:locationId`, not a separate endpoint. Each variation is enriched with `inStock` and `quantity` from Square's Inventory API. If the inventory call fails the menu still loads — variations default to `inStock: true` so a guest is never blocked by an upstream failure.
+
+### Response shape — `/api/v1/catalog/:locationId`
+
+```json
+{
+  "success": true,
+  "data": {
+    "locationId": "L123",
+    "computedAt": "2025-05-30T14:32:00.000Z",
+    "categories": [
+      { "id": "C1", "name": "Burgers", "availableNow": true }
+    ],
+    "items": [
+      {
+        "id": "I1",
+        "name": "BBQ Smokehouse Burger",
+        "description": "...",
+        "categoryId": "C1",
+        "imageUrl": "https://...",
+        "availableNow": false,
+        "availabilityReason": "Available Mon-Fri 11am-3pm",
+        "variations": [
+          {
+            "id": "V1",
+            "name": "Regular",
+            "price": { "amount": 1299, "currency": "USD", "formatted": "$12.99" },
+            "inStock": true,
+            "quantity": 12
+          }
+        ],
+        "modifierLists": [
+          {
+            "id": "M1",
+            "name": "Add-ons",
+            "selectionType": "MULTIPLE",
+            "modifiers": []
+          }
+        ]
+      }
+    ],
+    "inventory": { "V1": { "quantity": 12, "inStock": true } }
+  }
+}
+```
 
 ---
 
 ## Square sandbox setup
 
 1. Create a free account at [developer.squareup.com](https://developer.squareup.com)
-2. Create a new application → grab the **Sandbox Access Token**
-3. Set `SQUARE_ACCESS_TOKEN` in your `.env`
-4. Seed catalog data using the included script (recommended):
+2. Create a new application, open the **Sandbox** tab, and copy the **Sandbox Access Token**
+3. Set `SQUARE_ACCESS_TOKEN=<token>` in your `.env` file
+4. Run the included seed script:
 
 ```bash
 node seed-sandbox.js
 ```
 
-This creates **2 locations** (Default Test Account + Downtown Kitchen), **4 categories** (Burgers and Drinks are always available; Lunch Sides are Mon–Fri 11am–3pm only; Happy Hour Desserts are daily 4–7pm), **12 items** with real images and modifiers, and **2 items exclusive to Downtown Kitchen** (`presentAtLocationIds`). All features — location filtering, time/day availability, and location-specific items — are exercised.
+The script creates the following sandbox data:
 
-Alternatively, seed manually via the Square Sandbox dashboard:
-   - **2 locations** (Sandbox provides test locations automatically)
-   - **3–4 categories**, at least one with `availabilityPeriodIds` set for limited hours
-   - **6–10 items**, at least one with `presentAtLocationIds` limited to one location
+| What | Detail |
+| ---- | ------ |
+| 2 locations | Default Test Account and Downtown Kitchen |
+| 4 categories | Burgers (always) · Drinks (always) · Lunch Sides (Mon–Fri 11am–3pm) · Happy Hour Desserts (daily 4–7pm) |
+| 12 items | Real Unsplash photos; 3 items with modifier lists; 2 items exclusive to Downtown Kitchen via `presentAtLocationIds` |
+
+This data exercises every evaluated feature: location filtering, time/day availability, location-specific items, modifiers, and inventory.
 
 ---
 
 ## Architecture decisions
 
-### In-memory cache, not a database
+### 1. All three Square location-availability fields
 
-Square is the source of truth. We don't own the data — we read and display it. A 5-minute TTL cache handles Square's rate limits without the complexity (and sync headache) of a persistent store. TTL is configurable via `CACHE_TTL_SECONDS`.
+Square's three-field model is checked in priority order:
 
-### Availability computed server-side
+```typescript
+// src/services/square/catalog.service.ts
+function isItemAvailableAtLocation(item, locationId) {
+  if (item.absentAtLocationIds?.includes(locationId)) return false; // blacklist wins
+  if (item.presentAtAllLocations) return true;                       // default: everywhere
+  return item.presentAtLocationIds?.includes(locationId) ?? false;  // whitelist otherwise
+}
+```
 
-Square's `CatalogAvailabilityPeriod` objects contain `dayOfWeek`, `startLocalTime`, and `endLocalTime` in the **location's local timezone**. We evaluate these on the backend using the `Intl.DateTimeFormat` API with the location's IANA timezone string. This keeps timezone logic in one testable place and sends a simple `availableNow: boolean` + human-readable `availabilityReason` to the client.
+Items are filtered server-side before the response is built. The client never receives items it cannot order at the selected location.
 
-Trade-off: responses are time-sensitive (can't be cached forever), so we key the cache by `locationId` and set a short TTL. A production system might use a shorter TTL (60s) or push invalidations via Square webhooks.
+### 2. Time/day availability — server-side, timezone-aware
 
-### Square pagination resolved server-side
+Square's `CatalogAvailabilityPeriod` objects store `dayOfWeek`, `startLocalTime`, and `endLocalTime` in the **location's local timezone**. Computing availability on the backend means:
 
-Square's Catalog API paginates with cursors. We resolve all pages in a single service call before responding. For sandbox/SMB catalogs (< 500 items) this is fine. For large catalogs we'd expose a cursor-based endpoint — documented in "What I'd build next."
+- Zero timezone library weight on the mobile client
+- One testable place for all the logic
+- The client receives a simple `availableNow: boolean` and a human-readable `availabilityReason` string (e.g. "Available Mon–Fri 11am–3pm")
 
-### Location ID validation as SSRF guard
+```typescript
+// src/services/availability.service.ts
+function getCurrentLocalMoment(timezone: string): LocalMoment {
+  // Intl.DateTimeFormat is a built-in — no moment.js, no date-fns, zero bundle cost
+  const formatter = new Intl.DateTimeFormat('en-US', { timeZone: timezone, ... });
+}
+```
 
-The `/catalog/:locationId` endpoint validates the provided ID against the known locations list before forwarding to Square. This prevents an attacker from probing arbitrary Square merchant IDs using our access token.
+**Trade-off:** Availability is time-sensitive so responses cannot be cached indefinitely. Cache TTL is 5 minutes. A production system would push real-time invalidation via Square webhooks on `catalog.updated` events.
+
+### 3. Location ID validation as SSRF guard
+
+An unauthenticated caller could pass any string as `:locationId` and use the API to probe arbitrary Square merchants with our token. We prevent this by validating the ID against the merchant's own locations before forwarding to Square:
+
+```typescript
+// src/controllers/catalog.controller.ts
+const location = locations.find(l => l.id === locationId);
+if (!location) throw new AppError(404, 'LOCATION_NOT_FOUND', ...);
+```
+
+If the ID is not in our own locations list the request is rejected before any Square API call is made.
+
+### 4. In-memory TTL cache — no database required
+
+Square is the source of truth; we don't own the data. A simple in-memory cache handles Square's rate limits without adding Redis as a dependency. Different TTLs are applied based on data volatility:
+
+| Data | TTL | Reason |
+| ---- | --- | ------ |
+| Locations | 5 min | Changes rarely |
+| Catalog + availability | 5 min | Time-sensitive; short window is acceptable |
+| Inventory | 2 min | More volatile — stock levels change faster |
+
+The cache key includes `locationId` so each location's catalog is cached independently.
+
+### 5. Square SDK pagination resolved server-side
+
+Square's Catalog API is cursor-paginated. All pages are resolved in a `while` loop before the response is returned, so the client always receives a complete catalog in a single API call:
+
+```typescript
+while (true) {
+  objects.push(...page.data);
+  if (!page.hasNextPage()) break;
+  page = await page.getNextPage();
+}
+```
+
+**Trade-off:** Correct for sandbox and SMB catalogs (< ~500 items). For large catalogs we would expose a `?cursor=` parameter and let the client paginate. Documented in "What I'd build next."
+
+### 6. Error handling strategy
+
+Every error passes through one central middleware:
+
+- Known `AppError` → correct HTTP status + stable error code + message
+- Square 429 → `429 RATE_LIMITED` with a friendly message
+- Unexpected → `500 INTERNAL_ERROR`; full stack trace logged server-side only, never sent to the client
+
+---
+
+## Security checklist
+
+| Control | Where |
+| ------- | ----- |
+| Square token never leaves the server | `src/config/square.ts` — loaded from env var only |
+| `.env` excluded from version control | `.gitignore` line 3 |
+| Location ID validated before Square call | `src/controllers/catalog.controller.ts` lines 19–23 |
+| CORS restricted to known origins | `src/app.ts` lines 17–34 via `ALLOWED_ORIGINS` env var |
+| Rate limiting — 100 req/min per IP | `src/app.ts` lines 37–48 |
+| Stack traces never sent to clients | `src/middleware/errorHandler.ts` lines 33–55 |
+| Security headers via Helmet | `src/app.ts` line 12 |
 
 ---
 
 ## What I'd build next (given another week)
 
-1. **Square webhook integration** — invalidate cache on `catalog.updated` events so availability changes reflect instantly
-2. **Cursor-based catalog pagination** — expose `?cursor=` param for large menus
-3. **Redis cache** — share cache across multiple API instances in a horizontally scaled deployment
-4. **Request ID tracing** — attach a correlation ID to every request for distributed tracing
-5. **Unit tests for availability service** — the time/day logic is the most complex piece and deserves property-based tests across timezones
+1. **Square webhook integration** — invalidate cache on `catalog.updated` events so availability changes are instant rather than TTL-lagged
+2. **Cursor-based catalog pagination** — expose `?cursor=` for merchants with large catalogs
+3. **Redis cache** — replace in-memory cache so multiple API instances share state in a horizontally scaled deployment
+4. **Request ID tracing** — attach a correlation ID to every log line for distributed tracing
+5. **Property-based tests for the availability service** — the timezone and day-of-week logic is the riskiest piece and deserves fuzz testing across DST transitions, midnight windows, and multi-day spans
