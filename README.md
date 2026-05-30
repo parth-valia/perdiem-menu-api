@@ -23,7 +23,7 @@ node seed-sandbox.js
 npm run dev
 ```
 
-Server starts on **http://localhost:3001**.
+Server starts on **`http://localhost:3001`**.
 
 ```bash
 # Smoke test
@@ -105,8 +105,10 @@ The script creates the following sandbox data:
 | What | Detail |
 | ---- | ------ |
 | 2 locations | Default Test Account and Downtown Kitchen |
-| 4 categories | Burgers (always) · Drinks (always) · Lunch Sides (Mon–Fri 11am–3pm) · Happy Hour Desserts (daily 4–7pm) |
-| 12 items | Real Unsplash photos; 3 items with modifier lists; 2 items exclusive to Downtown Kitchen via `presentAtLocationIds` |
+| 6 categories | Burgers (always) · Drinks (always) · Lunch Sides (Mon–Fri 11am–3pm) · Happy Hour Desserts (daily 4–7pm) · Breakfast (Mon–Fri 7–11am) · Weekend Brunch (Sat–Sun 9am–3pm) |
+| 16 items | Real Unsplash photos; items with modifier lists; 2 items exclusive to Downtown Kitchen via `presentAtLocationIds` |
+
+**Availability is easy to see during testing:** Breakfast items are greyed out outside 7–11am; Weekend Brunch items are always greyed on weekdays — so the unavailability UI is visible without waiting for a specific time window.
 
 This data exercises every evaluated feature: location filtering, time/day availability, location-specific items, modifiers, and inventory.
 

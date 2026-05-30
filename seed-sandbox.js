@@ -3,9 +3,17 @@
  * Run: node seed-sandbox.js
  *
  * What this does (all via Square v2 API):
- *   1. Clears existing catalog  → POST /v2/catalog/batch-delete
- *   2. Uploads images           → POST /v2/catalog/images  (multipart)
- *   3. Creates full catalog     → POST /v2/catalog/batch-upsert
+ *   0. Ensure 2 locations exist → POST /v2/locations
+ *   1. Clear existing catalog   → POST /v2/catalog/batch-delete
+ *   2. Upload images            → POST /v2/catalog/images  (multipart)
+ *   3. Create full catalog      → POST /v2/catalog/batch-upsert
+ *      - 6 categories, 4 with time-of-day availability periods
+ *      - 16 items: most at all locations, 2 exclusive to Downtown only
+ *      - Availability windows:
+ *          Lunch Sides     Mon-Fri 11am-3pm
+ *          Happy Hour      daily 4pm-7pm
+ *          Breakfast       Mon-Fri 7am-11am  (greyed outside those hours)
+ *          Weekend Brunch  Sat-Sun 9am-3pm   (ALWAYS greyed on weekdays)
  *
  * Docs:
  *   https://developer.squareup.com/reference/square/catalog-api
@@ -42,6 +50,26 @@ const ITEM_IMAGES = [
     key: 'veggie-burger',
     name: 'Veggie Burger',
     url: 'https://images.unsplash.com/photo-1520072959219-c595dc870360?w=800&fm=jpg&fit=crop&q=80',
+  },
+  {
+    key: 'avocado-toast',
+    name: 'Avocado Toast',
+    url: 'https://images.unsplash.com/photo-1603046891726-36bfd957e0bf?w=800&fm=jpg&fit=crop&q=80',
+  },
+  {
+    key: 'french-toast',
+    name: 'French Toast Stack',
+    url: 'https://images.unsplash.com/photo-1484723091739-30a097e8f929?w=800&fm=jpg&fit=crop&q=80',
+  },
+  {
+    key: 'pancakes',
+    name: 'Banana Pancake Stack',
+    url: 'https://images.unsplash.com/photo-1567620905732-2d1ec7ab7445?w=800&fm=jpg&fit=crop&q=80',
+  },
+  {
+    key: 'brunch-burger',
+    name: 'Weekend Brunch Burger',
+    url: 'https://images.unsplash.com/photo-1571091718767-18b5b1457add?w=800&fm=jpg&fit=crop&q=80',
   },
   {
     key: 'cola',
@@ -136,15 +164,59 @@ const tmpId = (name) => `#${name}`;
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+async function ensureSecondLocation() {
+  const locsResp = await client.locations.list();
+  const existing = locsResp.locations ?? [];
+  if (existing.length >= 2) {
+    console.log(`  Found ${existing.length} locations — skipping create.`);
+    return existing.map(l => l.id);
+  }
+  // Square sandbox starts with 1 "Default Test Account" location.
+  // Create a second one so the location switcher is meaningful.
+  const created = await client.locations.create({
+    location: {
+      name: 'Downtown Kitchen',
+      description: 'Our flagship downtown location. Lunch and happy hour specials.',
+      address: {
+        addressLine1: '420 Main St',
+        locality: 'San Francisco',
+        administrativeDistrictLevel1: 'CA',
+        postalCode: '94105',
+        country: 'US',
+      },
+      timezone: 'America/Los_Angeles',
+      businessHours: {
+        periods: [
+          { dayOfWeek: 'MON', startLocalTime: '10:00:00', endLocalTime: '22:00:00' },
+          { dayOfWeek: 'TUE', startLocalTime: '10:00:00', endLocalTime: '22:00:00' },
+          { dayOfWeek: 'WED', startLocalTime: '10:00:00', endLocalTime: '22:00:00' },
+          { dayOfWeek: 'THU', startLocalTime: '10:00:00', endLocalTime: '22:00:00' },
+          { dayOfWeek: 'FRI', startLocalTime: '10:00:00', endLocalTime: '23:00:00' },
+          { dayOfWeek: 'SAT', startLocalTime: '11:00:00', endLocalTime: '23:00:00' },
+        ],
+      },
+    },
+  });
+  if (created.errors?.length) throw new Error(`Location create failed: ${JSON.stringify(created.errors)}`);
+  const newId = created.location.id;
+  console.log(`  Created "Downtown Kitchen" → ${newId}`);
+  return [existing[0].id, newId];
+}
+
 async function seed() {
   const tmpDir = os.tmpdir();
 
+  // 0. Ensure 2 locations exist
+  console.log('0/4  Ensuring 2 locations...');
+  const [loc1Id, loc2Id] = await ensureSecondLocation();
+  console.log(`  Location 1: ${loc1Id}  |  Location 2: ${loc2Id}`);
+
   // 1. Clear existing catalog
-  console.log('1/3  Clearing existing catalog...');
+  console.log('1/4  Clearing existing catalog...');
   await clearCatalog();
 
   // 2. Download + upload images
-  console.log('2/3  Uploading images to Square sandbox...');
+  console.log('2/4  Uploading images to Square sandbox...');
   const imageIds = {};
 
   for (const img of ITEM_IMAGES) {
@@ -162,7 +234,7 @@ async function seed() {
   }
 
   // 3. Batch-upsert full catalog
-  console.log('3/3  Creating catalog objects...');
+  console.log('3/4  Creating catalog objects...');
 
   const imgIds = (key) => {
     const id = imageIds[key];
@@ -174,6 +246,34 @@ async function seed() {
     batches: [
       {
         objects: [
+          // ── Availability periods ──────────────────────────────────────────
+          // Lunch special: Mon-Fri 11am-3pm. Each period covers one day
+          // because Square's CatalogAvailabilityPeriod is per-day-of-week.
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-lunch-mon'), availabilityPeriodData: { dayOfWeek: 'MON', startLocalTime: '11:00:00', endLocalTime: '15:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-lunch-tue'), availabilityPeriodData: { dayOfWeek: 'TUE', startLocalTime: '11:00:00', endLocalTime: '15:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-lunch-wed'), availabilityPeriodData: { dayOfWeek: 'WED', startLocalTime: '11:00:00', endLocalTime: '15:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-lunch-thu'), availabilityPeriodData: { dayOfWeek: 'THU', startLocalTime: '11:00:00', endLocalTime: '15:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-lunch-fri'), availabilityPeriodData: { dayOfWeek: 'FRI', startLocalTime: '11:00:00', endLocalTime: '15:00:00' } },
+          // Happy hour: daily 4pm-7pm
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-happy-mon'), availabilityPeriodData: { dayOfWeek: 'MON', startLocalTime: '16:00:00', endLocalTime: '19:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-happy-tue'), availabilityPeriodData: { dayOfWeek: 'TUE', startLocalTime: '16:00:00', endLocalTime: '19:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-happy-wed'), availabilityPeriodData: { dayOfWeek: 'WED', startLocalTime: '16:00:00', endLocalTime: '19:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-happy-thu'), availabilityPeriodData: { dayOfWeek: 'THU', startLocalTime: '16:00:00', endLocalTime: '19:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-happy-fri'), availabilityPeriodData: { dayOfWeek: 'FRI', startLocalTime: '16:00:00', endLocalTime: '19:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-happy-sat'), availabilityPeriodData: { dayOfWeek: 'SAT', startLocalTime: '16:00:00', endLocalTime: '19:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-happy-sun'), availabilityPeriodData: { dayOfWeek: 'SUN', startLocalTime: '16:00:00', endLocalTime: '19:00:00' } },
+          // Breakfast: Mon-Fri 7am-11am only. Items in this category are greyed
+          // out outside those hours — exercises the "unavailable with reason" UI.
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-bkfast-mon'), availabilityPeriodData: { dayOfWeek: 'MON', startLocalTime: '07:00:00', endLocalTime: '11:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-bkfast-tue'), availabilityPeriodData: { dayOfWeek: 'TUE', startLocalTime: '07:00:00', endLocalTime: '11:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-bkfast-wed'), availabilityPeriodData: { dayOfWeek: 'WED', startLocalTime: '07:00:00', endLocalTime: '11:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-bkfast-thu'), availabilityPeriodData: { dayOfWeek: 'THU', startLocalTime: '07:00:00', endLocalTime: '11:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-bkfast-fri'), availabilityPeriodData: { dayOfWeek: 'FRI', startLocalTime: '07:00:00', endLocalTime: '11:00:00' } },
+          // Weekend Brunch: Sat-Sun only. On weekdays these items are ALWAYS unavailable,
+          // making the greyed-out feature trivially visible during weekday testing.
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-brunch-sat'), availabilityPeriodData: { dayOfWeek: 'SAT', startLocalTime: '09:00:00', endLocalTime: '15:00:00' } },
+          { type: 'AVAILABILITY_PERIOD', id: tmpId('ap-brunch-sun'), availabilityPeriodData: { dayOfWeek: 'SUN', startLocalTime: '09:00:00', endLocalTime: '15:00:00' } },
+
           // ── Categories ────────────────────────────────────────────────────
           {
             type: 'CATEGORY',
@@ -186,14 +286,55 @@ async function seed() {
             categoryData: { name: 'Drinks' },
           },
           {
+            // Sides are a weekday lunch special — only available Mon-Fri 11am-3pm.
+            // This exercises the time/day availability feature in the assignment.
             type: 'CATEGORY',
             id: tmpId('cat-sides'),
-            categoryData: { name: 'Sides' },
+            categoryData: {
+              name: 'Lunch Sides',
+              availabilityPeriodIds: [
+                tmpId('ap-lunch-mon'), tmpId('ap-lunch-tue'), tmpId('ap-lunch-wed'),
+                tmpId('ap-lunch-thu'), tmpId('ap-lunch-fri'),
+              ],
+            },
           },
           {
+            // Desserts are a happy hour / evening special — daily 4pm-7pm.
             type: 'CATEGORY',
             id: tmpId('cat-desserts'),
-            categoryData: { name: 'Desserts' },
+            categoryData: {
+              name: 'Happy Hour Desserts',
+              availabilityPeriodIds: [
+                tmpId('ap-happy-mon'), tmpId('ap-happy-tue'), tmpId('ap-happy-wed'),
+                tmpId('ap-happy-thu'), tmpId('ap-happy-fri'),
+                tmpId('ap-happy-sat'), tmpId('ap-happy-sun'),
+              ],
+            },
+          },
+          {
+            // Breakfast: Mon-Fri 7am-11am. During the rest of the day these items
+            // show greyed-out with "Available Mon-Fri 7am-11am" on the card.
+            type: 'CATEGORY',
+            id: tmpId('cat-breakfast'),
+            categoryData: {
+              name: 'Breakfast',
+              availabilityPeriodIds: [
+                tmpId('ap-bkfast-mon'), tmpId('ap-bkfast-tue'), tmpId('ap-bkfast-wed'),
+                tmpId('ap-bkfast-thu'), tmpId('ap-bkfast-fri'),
+              ],
+            },
+          },
+          {
+            // Weekend Brunch: Sat-Sun 9am-3pm. On any weekday every item in this
+            // category is unavailable — the most reliable way to demo the feature.
+            type: 'CATEGORY',
+            id: tmpId('cat-brunch'),
+            categoryData: {
+              name: 'Weekend Brunch',
+              availabilityPeriodIds: [
+                tmpId('ap-brunch-sat'), tmpId('ap-brunch-sun'),
+              ],
+            },
           },
 
           // ── Modifier lists ────────────────────────────────────────────────
@@ -325,7 +466,7 @@ async function seed() {
               name: 'Classic Smash Burger',
               description:
                 'Two smashed beef patties, American cheese, shredded lettuce, tomato, pickles, and our house "Perdiem" sauce on a toasted brioche bun.',
-              categoryId: tmpId('cat-burgers'),
+              categories: [{ id: tmpId('cat-burgers') }],
               imageIds: imgIds('classic-burger'),
               modifierListInfo: [
                 { modifierListId: tmpId('ml-extras'), enabled: true },
@@ -370,7 +511,7 @@ async function seed() {
               name: 'BBQ Smokehouse Burger',
               description:
                 'Beef patty topped with pulled pork, smoked cheddar, crispy onion straws, and tangy house-made BBQ sauce.',
-              categoryId: tmpId('cat-burgers'),
+              categories: [{ id: tmpId('cat-burgers') }],
               imageIds: imgIds('bbq-burger'),
               modifierListInfo: [
                 { modifierListId: tmpId('ml-extras'), enabled: true },
@@ -406,7 +547,7 @@ async function seed() {
               name: 'Garden Veggie Burger',
               description:
                 'House-made black bean and roasted corn patty, pepper jack cheese, roasted red peppers, arugula, and chipotle aioli.',
-              categoryId: tmpId('cat-burgers'),
+              categories: [{ id: tmpId('cat-burgers') }],
               imageIds: imgIds('veggie-burger'),
               modifierListInfo: [
                 { modifierListId: tmpId('ml-extras'), enabled: true },
@@ -426,14 +567,17 @@ async function seed() {
             },
           },
           {
+            // Downtown-exclusive — only at loc2 (Downtown Kitchen).
+            // Demonstrates present_at_location_ids filtering.
             type: 'ITEM',
             id: tmpId('item-mushroom-burger'),
-            presentAtAllLocations: true,
+            presentAtAllLocations: false,
+            presentAtLocationIds: [loc2Id],
             itemData: {
               name: 'Truffle Mushroom Burger',
               description:
-                'Beef patty, sautéed wild mushrooms, Swiss cheese, caramelized onions, and truffle aioli on a pretzel bun.',
-              categoryId: tmpId('cat-burgers'),
+                'Beef patty, sautéed wild mushrooms, Swiss cheese, caramelized onions, and truffle aioli on a pretzel bun. Downtown Kitchen exclusive.',
+              categories: [{ id: tmpId('cat-burgers') }],
               imageIds: imgIds('classic-burger'),
               modifierListInfo: [
                 { modifierListId: tmpId('ml-extras'), enabled: true },
@@ -443,6 +587,8 @@ async function seed() {
                 {
                   type: 'ITEM_VARIATION',
                   id: tmpId('var-mushroom-single'),
+                  presentAtAllLocations: false,
+                  presentAtLocationIds: [loc2Id],
                   itemVariationData: {
                     name: 'Single',
                     pricingType: 'FIXED_PRICING',
@@ -452,6 +598,8 @@ async function seed() {
                 {
                   type: 'ITEM_VARIATION',
                   id: tmpId('var-mushroom-double'),
+                  presentAtAllLocations: false,
+                  presentAtLocationIds: [loc2Id],
                   itemVariationData: {
                     name: 'Double',
                     pricingType: 'FIXED_PRICING',
@@ -470,7 +618,7 @@ async function seed() {
             itemData: {
               name: 'Classic Cola',
               description: 'Ice-cold Coca-Cola served fountain style over crushed ice.',
-              categoryId: tmpId('cat-drinks'),
+              categories: [{ id: tmpId('cat-drinks') }],
               imageIds: imgIds('cola'),
               modifierListInfo: [{ modifierListId: tmpId('ml-drink-size'), enabled: true }],
               variations: [
@@ -494,7 +642,7 @@ async function seed() {
               name: 'Fresh-Squeezed Lemonade',
               description:
                 'Made daily from real lemons with cane sugar. Ask about our seasonal flavors.',
-              categoryId: tmpId('cat-drinks'),
+              categories: [{ id: tmpId('cat-drinks') }],
               imageIds: imgIds('lemonade'),
               modifierListInfo: [{ modifierListId: tmpId('ml-drink-size'), enabled: true }],
               variations: [
@@ -511,20 +659,24 @@ async function seed() {
             },
           },
           {
+            // Downtown-exclusive — demonstrates present_at_location_ids filtering.
             type: 'ITEM',
             id: tmpId('item-milkshake'),
-            presentAtAllLocations: true,
+            presentAtAllLocations: false,
+            presentAtLocationIds: [loc2Id],
             itemData: {
               name: 'Hand-Spun Milkshake',
               description:
-                'Thick, creamy milkshake made with premium ice cream. Vanilla, Chocolate, or Strawberry.',
-              categoryId: tmpId('cat-drinks'),
+                'Thick, creamy milkshake made with premium ice cream. Vanilla, Chocolate, or Strawberry. Downtown Kitchen exclusive.',
+              categories: [{ id: tmpId('cat-drinks') }],
               imageIds: imgIds('milkshake'),
               modifierListInfo: [],
               variations: [
                 {
                   type: 'ITEM_VARIATION',
                   id: tmpId('var-shake-vanilla'),
+                  presentAtAllLocations: false,
+                  presentAtLocationIds: [loc2Id],
                   itemVariationData: {
                     name: 'Vanilla',
                     pricingType: 'FIXED_PRICING',
@@ -534,6 +686,8 @@ async function seed() {
                 {
                   type: 'ITEM_VARIATION',
                   id: tmpId('var-shake-chocolate'),
+                  presentAtAllLocations: false,
+                  presentAtLocationIds: [loc2Id],
                   itemVariationData: {
                     name: 'Chocolate',
                     pricingType: 'FIXED_PRICING',
@@ -543,6 +697,8 @@ async function seed() {
                 {
                   type: 'ITEM_VARIATION',
                   id: tmpId('var-shake-strawberry'),
+                  presentAtAllLocations: false,
+                  presentAtLocationIds: [loc2Id],
                   itemVariationData: {
                     name: 'Strawberry',
                     pricingType: 'FIXED_PRICING',
@@ -562,7 +718,7 @@ async function seed() {
               name: 'Crispy Shoestring Fries',
               description:
                 'Double-fried shoestring fries seasoned with smoked sea salt and fresh herbs.',
-              categoryId: tmpId('cat-sides'),
+              categories: [{ id: tmpId('cat-sides') }],
               imageIds: imgIds('fries'),
               variations: [
                 {
@@ -594,7 +750,7 @@ async function seed() {
               name: 'Beer-Battered Onion Rings',
               description:
                 'Thick-cut Vidalia onion rings in a light craft beer batter, served with house ranch.',
-              categoryId: tmpId('cat-sides'),
+              categories: [{ id: tmpId('cat-sides') }],
               imageIds: imgIds('onion-rings'),
               variations: [
                 {
@@ -617,7 +773,7 @@ async function seed() {
               name: 'Truffle Mac & Cheese',
               description:
                 'Creamy four-cheese sauce, cavatappi pasta, truffle oil, and toasted breadcrumbs.',
-              categoryId: tmpId('cat-sides'),
+              categories: [{ id: tmpId('cat-sides') }],
               imageIds: imgIds('fries'),
               variations: [
                 {
@@ -642,7 +798,7 @@ async function seed() {
               name: 'Warm Chocolate Brownie',
               description:
                 'Fudgy chocolate brownie served warm with a scoop of vanilla ice cream and caramel drizzle.',
-              categoryId: tmpId('cat-desserts'),
+              categories: [{ id: tmpId('cat-desserts') }],
               variations: [
                 {
                   type: 'ITEM_VARIATION',
@@ -664,7 +820,7 @@ async function seed() {
               name: 'New York Cheesecake',
               description:
                 'Classic New York-style cheesecake on a graham cracker crust, topped with fresh berry compote.',
-              categoryId: tmpId('cat-desserts'),
+              categories: [{ id: tmpId('cat-desserts') }],
               variations: [
                 {
                   type: 'ITEM_VARIATION',
@@ -673,6 +829,109 @@ async function seed() {
                     name: 'Slice',
                     pricingType: 'FIXED_PRICING',
                     priceMoney: { amount: BigInt(849), currency: 'USD' },
+                  },
+                },
+              ],
+            },
+          },
+
+          // ── Breakfast (Mon-Fri 7am-11am) ──────────────────────────────────
+          // These items are unavailable outside those hours and will show
+          // greyed-out with "Available Mon-Fri 7am-11am" on the menu card.
+          {
+            type: 'ITEM',
+            id: tmpId('item-avocado-toast'),
+            presentAtAllLocations: true,
+            itemData: {
+              name: 'Avocado Toast',
+              description:
+                'Smashed avocado on sourdough with cherry tomatoes, everything bagel seasoning, a drizzle of chili oil, and two soft-poached eggs.',
+              categories: [{ id: tmpId('cat-breakfast') }],
+              imageIds: imgIds('avocado-toast'),
+              variations: [
+                {
+                  type: 'ITEM_VARIATION',
+                  id: tmpId('var-avo-toast'),
+                  itemVariationData: {
+                    name: 'Regular',
+                    pricingType: 'FIXED_PRICING',
+                    priceMoney: { amount: BigInt(1149), currency: 'USD' },
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'ITEM',
+            id: tmpId('item-french-toast'),
+            presentAtAllLocations: true,
+            itemData: {
+              name: 'French Toast Stack',
+              description:
+                'Thick-cut brioche dipped in vanilla custard, pan-fried golden, stacked high with fresh berries, whipped cream, and maple syrup.',
+              categories: [{ id: tmpId('cat-breakfast') }],
+              imageIds: imgIds('french-toast'),
+              variations: [
+                {
+                  type: 'ITEM_VARIATION',
+                  id: tmpId('var-french-toast'),
+                  itemVariationData: {
+                    name: 'Regular',
+                    pricingType: 'FIXED_PRICING',
+                    priceMoney: { amount: BigInt(1099), currency: 'USD' },
+                  },
+                },
+              ],
+            },
+          },
+
+          // ── Weekend Brunch (Sat-Sun 9am-3pm) ─────────────────────────────
+          // On any weekday these are ALWAYS unavailable — the most reliable
+          // way to demonstrate the greyed-out availability UI during testing.
+          {
+            type: 'ITEM',
+            id: tmpId('item-pancakes'),
+            presentAtAllLocations: true,
+            itemData: {
+              name: 'Banana Pancake Stack',
+              description:
+                'Fluffy buttermilk pancakes layered with caramelised banana, toasted walnuts, and house-made toffee sauce. Weekend mornings only.',
+              categories: [{ id: tmpId('cat-brunch') }],
+              imageIds: imgIds('pancakes'),
+              variations: [
+                {
+                  type: 'ITEM_VARIATION',
+                  id: tmpId('var-pancakes'),
+                  itemVariationData: {
+                    name: 'Regular',
+                    pricingType: 'FIXED_PRICING',
+                    priceMoney: { amount: BigInt(1299), currency: 'USD' },
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'ITEM',
+            id: tmpId('item-brunch-burger'),
+            presentAtAllLocations: true,
+            itemData: {
+              name: 'Weekend Brunch Burger',
+              description:
+                'Beef patty with a fried egg, smoked bacon, cheddar, hollandaise, and baby spinach on a toasted English muffin. Saturdays and Sundays only.',
+              categories: [{ id: tmpId('cat-brunch') }],
+              imageIds: imgIds('brunch-burger'),
+              modifierListInfo: [
+                { modifierListId: tmpId('ml-extras'), enabled: true },
+              ],
+              variations: [
+                {
+                  type: 'ITEM_VARIATION',
+                  id: tmpId('var-brunch-burger'),
+                  itemVariationData: {
+                    name: 'Regular',
+                    pricingType: 'FIXED_PRICING',
+                    priceMoney: { amount: BigInt(1599), currency: 'USD' },
                   },
                 },
               ],
@@ -691,9 +950,14 @@ async function seed() {
   const mappings = resp.idMappings ?? [];
   console.log(`     Created ${mappings.length} catalog objects.`);
 
-  // ─── Summary ─────────────────────────────────────────────────────────────
+  // 4. Verify
+  console.log('4/4  Verifying...');
+  const locsResp = await client.locations.list();
+  console.log(`\n── Locations (${locsResp.locations?.length}) ─────────────────────────────────────`);
+  (locsResp.locations ?? []).forEach(l => console.log(`  ${l.id}  ${l.name}`));
+
   console.log('\n── Catalog Summary ──────────────────────────────────────────');
-  let page = await client.catalog.list({ types: 'ITEM,CATEGORY,MODIFIER_LIST,IMAGE' });
+  let page = await client.catalog.list({ types: 'ITEM,CATEGORY,MODIFIER_LIST,IMAGE,AVAILABILITY_PERIOD' });
   const all = [];
   while (true) {
     all.push(...page.data);
@@ -703,7 +967,7 @@ async function seed() {
 
   const byType = {};
   for (const o of all) byType[o.type] = (byType[o.type] ?? 0) + 1;
-  Object.entries(byType).forEach(([t, n]) => console.log(`  ${t.padEnd(16)} ${n}`));
+  Object.entries(byType).forEach(([t, n]) => console.log(`  ${t.padEnd(20)} ${n}`));
 
   const items = all.filter((o) => o.type === 'ITEM');
   console.log('\n── Items ─────────────────────────────────────────────────────');
@@ -711,7 +975,15 @@ async function seed() {
     const d = item.itemData;
     const hasImg = d?.imageIds?.length ? '🖼' : '  ';
     const vars = d?.variations?.length ?? 0;
-    console.log(`  ${hasImg}  ${d?.name?.padEnd(30)} ${vars} variation(s)`);
+    const loc = item.presentAtAllLocations ? 'all locations' : `loc-specific (${item.presentAtLocationIds?.length ?? 0})`;
+    console.log(`  ${hasImg}  ${(d?.name ?? '').padEnd(32)} ${vars} var  [${loc}]`);
+  }
+
+  const cats = all.filter(o => o.type === 'CATEGORY');
+  console.log('\n── Categories ────────────────────────────────────────────────');
+  for (const cat of cats) {
+    const periods = cat.categoryData?.availabilityPeriodIds?.length ?? 0;
+    console.log(`  ${cat.categoryData?.name?.padEnd(24)} ${periods ? `⏰ ${periods} availability period(s)` : 'always available'}`);
   }
 
   console.log('\n✓  Seed complete. Sandbox is ready.');
