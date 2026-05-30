@@ -27,8 +27,10 @@ Server starts on `http://localhost:3001`.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/health` | Health check |
-| GET | `/api/v1/locations` | All active locations |
-| GET | `/api/v1/catalog/:locationId` | Menu items for a location, with availability resolved |
+| GET | `/api/v1/locations` | All active Square locations (ACTIVE status only) |
+| GET | `/api/v1/catalog/:locationId` | Menu items filtered to a location, with time/day availability and inventory counts bundled in one response |
+
+> **Inventory** is resolved as part of `/catalog/:locationId` (not a separate endpoint). The catalog call enriches each variation with `inStock` and `quantity` from Square's Inventory API. If the inventory call fails, it degrades gracefully — the menu still loads and items default to in-stock.
 
 ---
 
@@ -43,7 +45,7 @@ Server starts on `http://localhost:3001`.
 node seed-sandbox.js
 ```
 
-This creates 2 locations, 4 categories (one with limited breakfast hours, one weekdays-only), 8 items with images, modifiers, and location-specific presence — everything needed to exercise all features including time/day availability.
+This creates **2 locations** (Default Test Account + Downtown Kitchen), **4 categories** (Burgers and Drinks are always available; Lunch Sides are Mon–Fri 11am–3pm only; Happy Hour Desserts are daily 4–7pm), **12 items** with real images and modifiers, and **2 items exclusive to Downtown Kitchen** (`presentAtLocationIds`). All features — location filtering, time/day availability, and location-specific items — are exercised.
 
 Alternatively, seed manually via the Square Sandbox dashboard:
    - **2 locations** (Sandbox provides test locations automatically)
