@@ -156,45 +156,6 @@ export async function getCatalogForLocation(
     });
   }
 
-  // Keyword → categoryId lookup for name-based fallback when Square items
-  // have no categoryId (common in sandbox). Maps food keywords to category names.
-  const CATEGORY_EXTRA_KEYWORDS: Record<string, string[]> = {
-    burger:   ['burger', 'smash', 'bbq', 'smokehouse', 'veggie burger', 'cheeseburger'],
-    drink:    ['cola', 'lemonade', 'milkshake', 'juice', 'soda', 'water', 'tea', 'coffee', 'smoothie', 'shake', 'spritz'],
-    side:     ['fries', 'rings', 'mac', 'salad', 'coleslaw', 'wings', 'nugget', 'tots', 'bread'],
-    dessert:  ['brownie', 'cheesecake', 'cake', 'cookie', 'pie', 'sundae', 'ice cream', 'gelato', 'pudding'],
-    appetizer: ['starter', 'appetizer', 'dip', 'nachos', 'bruschetta'],
-    pizza:    ['pizza', 'flatbread', 'calzone'],
-    pasta:    ['pasta', 'spaghetti', 'lasagna', 'penne', 'fettuccine'],
-    sandwich: ['sandwich', 'wrap', 'sub', 'panini', 'hoagie'],
-    salad:    ['salad', 'greens', 'caesar', 'cobb'],
-    soup:     ['soup', 'chowder', 'bisque', 'stew'],
-  };
-
-  // Build keyword → categoryId map using both the category name and extra keywords
-  const keywordToCatId = new Map<string, string>();
-  for (const [id, cat] of categoryMap) {
-    const baseName = cat.name.toLowerCase().replace(/s$/, ''); // "Burgers" → "burger"
-    keywordToCatId.set(baseName, id);
-    const extras = CATEGORY_EXTRA_KEYWORDS[baseName] ?? [];
-    for (const kw of extras) keywordToCatId.set(kw, id);
-  }
-
-  function inferCategoryId(itemName: string): string {
-    const lower = itemName.toLowerCase();
-    const words = new Set(lower.split(/\W+/));
-    for (const [keyword, catId] of keywordToCatId) {
-      // Multi-word keywords (e.g. "ice cream") use phrase match;
-      // single-word keywords must match a whole word to avoid false positives
-      // like "cola" matching inside "chocolate".
-      const matched = keyword.includes(' ')
-        ? lower.includes(keyword)
-        : words.has(keyword);
-      if (matched) return catId;
-    }
-    return '';
-  }
-
   const items: ApiCatalogItem[] = [];
 
   for (const item of raw.items) {
@@ -203,8 +164,17 @@ export async function getCatalogForLocation(
     const data = item.itemData;
     if (!data) continue;
 
-    // Item availability inherits from its category's availability periods
-    const periodIds = data.availabilityPeriodIds ?? [];
+    // Resolve availability periods: prefer item-level periods, fall back to
+    // the item's primary category periods. This is the standard Square pattern
+    // — merchants set periods on the category and all items in it inherit them.
+    // Without the fallback, items with no own periods always evaluate as available
+    // even when their category has a restricted window.
+    const itemPeriodIds = data.availabilityPeriodIds ?? [];
+    const primaryCatId = data.categories?.[0]?.id ?? data.categoryId ?? '';
+    const catPeriodIds = primaryCatId
+      ? (raw.categories.find(c => c.id === primaryCatId)?.categoryData?.availabilityPeriodIds ?? [])
+      : [];
+    const periodIds = itemPeriodIds.length > 0 ? itemPeriodIds : catPeriodIds;
     const { availableNow, reason } = evaluateAvailability(periodIds, raw.periods, timezone);
 
     const variations: ApiItemVariation[] = (data.variations ?? []).map(v => ({
@@ -218,14 +188,11 @@ export async function getCatalogForLocation(
       .map(m => buildModifierList(m.modifierListId!, raw.modifierLists))
       .filter((ml): ml is ApiModifierList => ml !== null);
 
-    const squareCategoryId = data.categories?.[0]?.id ?? data.categoryId ?? '';
-    const itemName = data.name ?? 'Unnamed Item';
-
     items.push({
       id: item.id,
-      name: itemName,
+      name: data.name ?? 'Unnamed Item',
       description: data.description ?? '',
-      categoryId: squareCategoryId || inferCategoryId(itemName),
+      categoryId: data.categories?.[0]?.id ?? data.categoryId ?? '',
       imageUrl: resolveImageUrl(data.imageIds, raw.images),
       variations,
       modifierLists,
